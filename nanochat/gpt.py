@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
 
-# Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
+# Our custom Flash Attention module that automatically uses FA4 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
 
 @dataclass

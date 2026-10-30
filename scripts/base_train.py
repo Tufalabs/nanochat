@@ -21,18 +21,19 @@ import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
 
-import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import Linear
+from nanochat.qwen3 import Qwen3 as GPT, config_for_depth
+from nanochat.tracking import init_run
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, print_banner, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA4
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -41,6 +42,9 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--log-every", type=int, default=10, help="training steps between W&B metric updates")
+parser.add_argument("--optimizer-timing-every", type=int, default=0,
+                    help="time optimizer with CUDA synchronization every N updates (0=off); adds synchronization overhead")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -51,7 +55,11 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", choices=["L"], default="L", help="Qwen3 uses full causal attention")
+parser.add_argument("--kv-group-size", type=int, default=2, help="query heads per KV head (GQA)")
+parser.add_argument("--mlp-ratio", type=float, default=3.0, help="SwiGLU intermediate width / model width, rounded up to 128")
+parser.add_argument("--rope-theta", type=float, default=1e6)
+parser.add_argument("--untie-embeddings", action="store_true", help="use separate input and output embeddings")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -60,10 +68,10 @@ parser.add_argument("--target-param-data-ratio", type=float, default=12, help="c
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.002, help="learning rate for tied embedding/head parameters (AdamW)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--matrix-lr", type=float, default=0.005, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--scalar-lr", type=float, default=0.1, help="Qwen3 RMSNorm AdamW learning rate is 0.01 times this value")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -77,8 +85,17 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--run-dir", type=str, default=None, help="directory containing every output for this run")
 args = parser.parse_args()
+from nanochat.run_paths import configure_run_dir
+run_dir = configure_run_dir(args.run_dir, tag=args.model_tag or f"qwen3_d{args.depth}")
+args.run_dir = str(run_dir)
+if args.log_every < 1:
+    parser.error("--log-every must be positive")
+if args.optimizer_timing_every < 0:
+    parser.error("--optimizer-timing-every must be nonnegative")
 user_config = vars(args).copy()  # for logging
+user_config["optimizer_timing_method"] = "synchronized_wall_clock" if args.optimizer_timing_every else "disabled"
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -96,21 +113,21 @@ else:
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = init_run(args.run, user_config, master_process=master_process)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
-    print0("✓ Using Flash Attention 3: efficient, new and awesome.")
+from nanochat.flash_attention import USE_FA4
+if USE_FA4:
+    print0("✓ Using FlashAttention-4 (CuTe DSL)")
 else:
     print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    if os.environ.get("NANOCHAT_ATTN") == "sdpa":
+        print0("WARNING: FlashAttention-4 disabled by NANOCHAT_ATTN=sdpa, using PyTorch SDPA fallback")
+    elif HAS_FA4 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: FlashAttention-4 is only used for bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
     else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
+        print0("WARNING: FlashAttention-4 not available, using PyTorch SDPA fallback")
+    print0("WARNING: Training will be less efficient without FA4")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
@@ -128,15 +145,11 @@ print0(f"Vocab size: {vocab_size:,}")
 
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    num_heads = model_dim // args.head_dim
-    config = GPTConfig(
+    config = config_for_depth(depth,
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        aspect_ratio=args.aspect_ratio, head_dim=args.head_dim,
+        kv_group_size=args.kv_group_size, mlp_ratio=args.mlp_ratio, rope_theta=args.rope_theta,
+        tie_word_embeddings=not args.untie_embeddings, window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -151,13 +164,13 @@ model.to_empty(device=device) # 2) All tensors get storage on target device but 
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+checkpoint_dir = str(run_dir / "checkpoints")
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    if meta_data["model_config"] != model_config_kwargs:
+        raise ValueError("checkpoint model config differs from this Qwen3 run; use the original shape arguments")
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -282,6 +295,11 @@ if total_batch_size == -1:
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+# --device-batch-size is an upper bound: halve it until one micro-batch across all ranks divides the total batch
+# (small models in a scaling ladder can get a total batch smaller than device_batch_size * max_seq_len * world_size)
+while args.device_batch_size > 1 and total_batch_size % (args.device_batch_size * args.max_seq_len * ddp_world_size) != 0:
+    args.device_batch_size //= 2
+    print0(f"Reduced device batch size to {args.device_batch_size} to divide total batch size {total_batch_size:,}")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
@@ -355,6 +373,18 @@ total_tokens = total_batch_size * num_iterations # the actual number of tokens w
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+wandb_run.config.update(dict(architecture="qwen3", model=model_config_kwargs, parameters=param_counts,
+    world_size=ddp_world_size, effective_device_batch_size=args.device_batch_size,
+    effective_total_batch_size=total_batch_size, effective_num_iterations=num_iterations,
+    tokens_planned=total_tokens, flops_per_token=num_flops_per_token))
+
+# Avoid a silent zero-batch validation when a custom budget is too small.
+eval_batch_tokens = args.device_batch_size * args.max_seq_len * ddp_world_size
+if args.eval_every > 0 and args.eval_tokens < eval_batch_tokens:
+    raise ValueError(f"--eval-tokens must be at least one distributed microbatch ({eval_batch_tokens:,})")
+if args.eval_every > 0:
+    print0(f"Validation tokens per pass: {args.eval_tokens // eval_batch_tokens * eval_batch_tokens:,} "
+           f"(requested {args.eval_tokens:,}; rounded down to whole microbatches)")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
@@ -411,6 +441,9 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+if args.optimizer_timing_every:
+    print0(f"Optimizer timing every {args.optimizer_timing_every} updates: synchronized wall time, "
+           "including optimizer communication; rank-zero timings, extra barriers on all ranks")
 
 # Go!
 while True:
@@ -506,7 +539,7 @@ while True:
     # single training step
     # evaluate the gradient
     synchronize()
-    t0 = time.time()
+    t0 = time.perf_counter()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -525,6 +558,14 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    # CUDA work is asynchronous. Drain backward first so its unfinished kernels are
+    # not charged to the optimizer, then wait for all optimizer/collective work below.
+    # Every rank takes the same timing boundaries; rank zero supplies the logged values.
+    measure_optimizer = args.optimizer_timing_every > 0 and (step + 1) % args.optimizer_timing_every == 0
+    optimizer_dt = None
+    if measure_optimizer:
+        synchronize()
+        optimizer_t0 = time.perf_counter()
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -537,10 +578,13 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    if measure_optimizer:
+        synchronize()
+        optimizer_dt = time.perf_counter() - optimizer_t0
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
-    t1 = time.time()
+    t1 = time.perf_counter()
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
@@ -564,11 +608,18 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    optimizer_metrics = {} if optimizer_dt is None else {
+        "train/optimizer_dt": optimizer_dt,
+        "train/optimizer_time_pct": 100 * optimizer_dt / dt,
+    }
+    optimizer_str = "" if optimizer_dt is None else (
+        f" | optimizer_dt: {optimizer_dt * 1000:.2f}ms | optimizer_time_pct: {100 * optimizer_dt / dt:.2f}%")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}{optimizer_str}")
+    if (step + 1) % args.log_every == 0 or step == num_iterations - 1 or measure_optimizer:
         log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
+            "step": step + 1,  # completed optimizer updates, aligned with validation
+            "total_training_flops": num_flops_per_token * total_batch_size * (step + 1),
+            "train/tokens": total_batch_size * (step + 1),
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
             "train/lrm": lrm,
@@ -576,6 +627,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            **optimizer_metrics,
         }
         wandb_run.log(log_data)
 
@@ -594,10 +646,18 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+peak_memory_mib = get_max_memory() / 1024**2
+if is_ddp_initialized():
+    # Report the worst rank across every node, not only rank zero's allocator.
+    peak = torch.tensor(peak_memory_mib, dtype=torch.float64, device=device)
+    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+    peak_memory_mib = peak.item()
+print0(f"Peak memory usage: {peak_memory_mib:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+wandb_run.summary.update(dict(completed_steps=step, tokens_trained=total_tokens,
+    train_time_sec=total_training_time, peak_memory_mib=peak_memory_mib))
 
 # cleanup
 wandb_run.finish() # wandb run finish

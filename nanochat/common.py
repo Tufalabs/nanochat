@@ -216,7 +216,8 @@ def compute_cleanup():
 class DummyWandb:
     """Useful if we wish to not use wandb but have all the same signatures"""
     def __init__(self):
-        pass
+        self.config = {}
+        self.summary = {}
     def log(self, *args, **kwargs):
         pass
     def finish(self):
@@ -231,6 +232,7 @@ def get_peak_flops(device_name: str) -> float:
     # Table order matters: more specific patterns first.
     _PEAK_FLOPS_TABLE = (
         # NVIDIA Blackwell
+        (["gb300"], 2.5e15),
         (["gb200"], 2.5e15),
         (["grace blackwell"], 2.5e15),
         (["b200"], 2.25e15),
@@ -286,6 +288,7 @@ def get_peak_bandwidth(device_name: str) -> float:
     # Table order matters: more specific patterns first.
     _PEAK_BANDWIDTH_TABLE = (
         # NVIDIA Blackwell (HBM3e)
+        (["gb300"], 8.0e12),
         (["gb200"], 8.0e12),
         (["grace blackwell"], 8.0e12),
         (["b200"], 8.0e12),

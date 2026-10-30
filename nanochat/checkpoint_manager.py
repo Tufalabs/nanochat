@@ -92,12 +92,20 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
+    if model_config_kwargs.get("architecture") == "qwen3":
+        from nanochat.qwen3 import Qwen3, Qwen3Config
+        model_config = Qwen3Config(**model_config_kwargs)
+        model_cls = Qwen3
+    elif model_config_kwargs.get("architecture") is None:
+        _patch_missing_config_keys(model_config_kwargs)
+        model_config = GPTConfig(**model_config_kwargs)
+        _patch_missing_keys(model_data, model_config)
+        model_cls = GPT
+    else:
+        raise ValueError(f"Unknown checkpoint architecture: {model_config_kwargs['architecture']}")
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = model_cls(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
@@ -161,6 +169,9 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
+    if source == "base" and os.environ.get("NANOCHAT_RUN_DIR"):
+        kwargs['model_tag'] = 'checkpoints'
+        return load_model_from_dir(os.environ['NANOCHAT_RUN_DIR'], *args, **kwargs)
     model_dir = {
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",
@@ -179,6 +190,9 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
+    if source == "base" and os.environ.get("NANOCHAT_RUN_DIR"):
+        checkpoints_dir = os.environ['NANOCHAT_RUN_DIR']
+        model_tag = 'checkpoints'
     if model_tag is None:
         model_tag = find_largest_model(checkpoints_dir)
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)

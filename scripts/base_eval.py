@@ -103,10 +103,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         # Shuffle for consistent subsampling when using max_per_task
         shuffle_rng = random.Random(1337)
         shuffle_rng.shuffle(data)
-        if max_per_task > 0:
-            data = data[:max_per_task]
-
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, max_examples=max_per_task)
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
@@ -129,12 +126,17 @@ def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
+    parser.add_argument('--run-dir', type=str, default=None, help='run folder containing checkpoints/; writes evaluation outputs inside it')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
     args = parser.parse_args()
+    from nanochat.run_paths import configure_run_dir
+    if not (args.run_dir or os.environ.get('NANOCHAT_RUN_DIR')):
+        parser.error('--run-dir is required to select the run and keep evaluation outputs with it')
+    configure_run_dir(args.run_dir)
 
     # Parse evaluation modes
     eval_modes = set(mode.strip() for mode in args.eval.split(','))
@@ -202,6 +204,8 @@ def main():
         print0("BPB Evaluation")
         print0("="*80)
         tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
+        if args.split_tokens < tokens_per_step:
+            parser.error(f"--split-tokens must be at least one distributed microbatch ({tokens_per_step:,} tokens)")
         if args.split_tokens % tokens_per_step != 0:
             # Adjust to nearest multiple
             args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
@@ -224,7 +228,7 @@ def main():
         # Write CSV output
         if ddp_rank == 0:
             base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            output_csv_path = os.path.join(os.environ['NANOCHAT_RUN_DIR'], "eval", f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")

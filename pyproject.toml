@@ -22,6 +22,7 @@ dev = [
     "matplotlib>=3.10.8",
     "pytest>=8.0.0",
     "python-dotenv>=1.2.1",
+    "transformers==4.57.1", # independent Qwen3 reference for architecture parity tests
 ]
 
 [tool.pytest.ini_options]
@@ -33,11 +34,11 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# target torch to cuda 12.8 or CPU
+# target torch to cuda 13.0 (GB300 / sm_103, aarch64) or CPU
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu128", extra = "gpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
 ]
 
 [[tool.uv.index]]
@@ -46,8 +47,8 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [project.optional-dependencies]
@@ -57,6 +58,8 @@ cpu = [
 ]
 gpu = [
     "torch==2.9.1",
+    "flash-attn-4[cu13]==4.0.0b37", # FlashAttention-4 (CuTe DSL, JIT-compiled) for Blackwell
+    "nvidia-cuda-nvcc==13.0.88", # Triton's bundled CUDA 12.8 ptxas cannot assemble sm_103a
 ]
 
 [tool.uv]
