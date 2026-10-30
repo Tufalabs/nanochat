@@ -1,6 +1,6 @@
 # Shared environment for every nanochat job on the thur cluster. Sourced by all slurm/* scripts.
 # Layout (everything lives under PRETRAIN_ROOT, nothing in $HOME):
-#   $PRETRAIN_ROOT/nanochat   code (this git checkout, local patches, never committed) + .venv
+#   $PRETRAIN_ROOT/nanochat   code checkout + shared .venv
 #   $PRETRAIN_ROOT/base       shared data shards, tokenizer and eval bundle
 #   $NANOCHAT_DIR/ladders     <ladder>/<run-tag>/ contains all run outputs; no source copies
 #   $PRETRAIN_ROOT/logs       shared data preparation / setup logs only

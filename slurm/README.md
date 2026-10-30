@@ -13,7 +13,7 @@ to a dry plan.
 | [ladder.py](ladder.py) | Direct grid CLI; status, report, list and resume |
 | [submit_run.py](submit_run.py) | Submit one named run inside a ladder folder |
 | [env.sh](env.sh), [setup.sh](setup.sh) | Shared paths, environment and dependency installation |
-| [jobs/](jobs/) | Slurm templates: training and one-off data preparation |
+| [jobs/](jobs/) | Slurm templates: training, environment setup and data preparation |
 | [benchmarks/](benchmarks/) | Node-throughput probes and their report tool |
 | [docs/](docs/) | Detailed usage, model/eval configuration and tracking |
 
@@ -88,10 +88,26 @@ from step zero. See [running and resuming](docs/running.md) for checkpoint conti
 
 ## Cluster setup
 
-Always source `slurm/env.sh` before using the Python tools. Setup is idempotent:
-`bash slurm/setup.sh` installs the shared venv; `sbatch slurm/jobs/data.sbatch` prepares
-data, tokenizer and CORE assets. Data preparation stays
-single-node because it is not distributed.
+Always source `slurm/env.sh` before using the Python tools. This activates an existing
+environment; it does not install packages. Install dependencies on a compute node:
+
+```bash
+source slurm/env.sh
+sbatch slurm/jobs/setup.sbatch
+# After setup completes successfully:
+# sbatch slurm/jobs/data.sbatch
+```
+
+Setup reserves one node and installs into `nanochat/.venv` on shared Lustre using
+`uv sync --locked`. All compute nodes reuse that venv. If an environment is already
+prepared, skip setup; training jobs only activate it. For dependency changes, update
+`uv.lock` deliberately and run setup again **after every job using that venv has
+finished**. Setup does not check for other consumers of the shared environment.
+
+To use an existing allocation, run `srun --nodes=1 --ntasks=1 bash slurm/setup.sh`.
+The script refuses installation outside the allocation's hosts, including a login
+shell that merely holds an `salloc` allocation. Setup and data preparation each use
+one node because neither is distributed. Setup logs go to `../logs/nanochat-setup-<job-id>.out`.
 
 Use account `llm-team` and `--gres=gpu:b300:4` per node. `dev` allows up to eight nodes
 per user and 12-hour jobs; account for other allocations when overriding concurrency.
